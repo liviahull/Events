@@ -1,0 +1,327 @@
+---
+title: "SEAMS"
+author: "Livia Hull"
+date: "24 May 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.keep = TRUE, echo=FALSE, warning=FALSE, message=FALSE, error = FALSE)
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(reshape2)
+library(rcompanion)
+library(binr)
+library(tibble)
+library(glm2)
+library(rpart)
+library(MASS)
+library(leaps)
+library(DAAG)
+library(sandwich)
+library(msm)
+library(car)
+```
+
+## Understanding causes of pipe assets failures
+
+### Introduction
+
+This is an analysis of the dataset Events.csv which aims at understanding what affects the asset failure rates and at determining a suitable predictive model for this variable.  
+
+The dataset has got records of 11 regions with pipe assets of various lenghts and diameters, which where installed at different dates in the past. Some assets have suffered failures, recorded as a number of events for each group. 
+
+The failure rate has been calculated as the number of events per km per year. 
+
+Short inspection of data shows that:
+
+* there are no missing values for these variables
+* 61% failure rates are zero, with large outliers are in Area 2, Area 4, Area 7, Area 8, Area 11
+* there are 9 types of pipes by diameter in mm (100, 150, 225, 300, 375, 450, 600, 900, 1050) with most of them are of 150 and 22 and least least of 900mm and 1050mm
+* the age of pipes varies from 3 year to 100 years with most of assets about 10 years old but there are some really old assets (over 75 years). The data is bimodal. 
+* the length varies from 0.00065 to 339 (Km) and the distribution is right skewed with most being less than 10 km
+* the number of failures varies from 0 to 457
+* all areas have similar distributions of assets by diameter
+
+```{r distrib_region_plot, include = TRUE, warning = FALSE, echo = FALSE, fig.width=10, fig.height = 8, fig.align = 'center'}
+# Read in data 
+mydata <- read_csv("Events.csv") %>% 
+  mutate(failure_rate = (Events/Length)/3) %>%
+  mutate(
+    Region  = case_when(
+      Region == "Area 1" ~ "Area 01",
+      Region == "Area 2" ~ "Area 02",
+      Region == "Area 3" ~ "Area 03",
+      Region == "Area 4" ~ "Area 04",
+      Region == "Area 5" ~ "Area 05",
+      Region == "Area 6" ~ "Area 06",
+      Region == "Area 7" ~ "Area 07",
+      Region == "Area 8" ~ "Area 08",
+      Region == "Area 9" ~ "Area 09",
+      TRUE               ~ Region
+    )
+  )
+
+  ggplot(mydata, aes(x=factor(Diameter))) +
+    geom_bar(fill = "red") +
+    theme_bw() +
+    facet_grid(Region~.)+
+    labs(x = "Diameter")
+
+```
+
+### Modelling
+
+To understand effects of age, length, region and diameter on pipe failure rate there are some modelling choices. One obvious choice is regression modelling, which is a way of estimating how these factors impact on pipe failure rate. 
+
+Multiple linear regression modelling was considered first, as it is the most simple regression model. However, because the pipe failure rate (response variable) cannot be modelled by a normal distribution, multiple linear regression cannot be used. 
+
+The second candidate is general linearised model (GLM) in a form of Poisson regression, given that the pipe failure rate is actually a count and all variables are positive. All variables were fitted first (Region, Diameter, Age, Length) then the model was tested for goddness-of-fit. It turns out that the data do not fit the model well, because the test on residual deviance (difference between the deviance of current model and the maximum deviance of the ideal model) is statistically significant (p-value almost 0), i.e. the  residual difference is large. 
+
+```{r poisson1, include = TRUE, warning = FALSE, echo = FALSE, fig.width=10, fig.height = 8, fig.align = 'center'}
+pois1 <- glm2(failure_rate ~ Age+Diameter+Length+Region, 
+     family = "poisson",
+     data = mydata)
+
+with(pois1, cbind(res.deviance = deviance, df = df.residual,
+               p = pchisq(deviance, df.residual, lower.tail=FALSE)))
+```
+
+Some diagnostic checks show simiar results: the deviance is not approximately normal, mean deviance is -0.3863955 instead of being close to 1, indicating under-dispersion of data. This is not surprising, given that there are very large outliers in Length and Age. The histogram below shows that the distribution of deviance residuals is right-skewed and not symmetrical (hence not normal).    
+
+```{r poisson1_diagnostics, include = TRUE, warning = FALSE, echo = FALSE, fig.width=10, fig.height = 8, fig.align = 'center'}
+modelPoisson <- summary(pois1)
+x <- modelPoisson$deviance.resid
+hist(x,
+     col="red",
+     breaks=10, 
+     xlab = "Residual Deviance",
+     main = "Histogram of residual deviance Poisson Model") # it does look a bit skewed 
+```
+
+There are other diagnostic plots that check homoscedasticity and outliers, showing patterns in variance and presence of extreme points. This is in accord to findings above, the Poisson model is not a good fit for the data.  
+```{r poisson1_plots, include = TRUE, warning = FALSE, echo = FALSE, fig.width=10, fig.height = 8, fig.align = 'center'}
+# diagnostic plots 
+layout(matrix(c(1,2,3,4),2,2)) # optional 4 graphs/page 
+plot(pois1)
+```
+
+Even when fitting fewer variables, for example eliminating Region first, then eliminating Length and fitting just Age and Diameter, the results are similar. Poisson regression is unfortunately not a good option. 
+
+As a result of all above, a logistic regression can be fit; but **first the failure rate needs to be changed from an interval variable to a discrete variable**. The simplest option is to change the failure rate into a binary variable: if the failure rate was 0, then the binary variable is 0 and if the failure rate is greater than 0 the binary variable will be 1. This means that if the group of assets had at least failure in the last 3 years, then the binary variable shows 1. The logistic regression  will then give the probability that the group of assets will be failing in the next year. 
+
+The model is a reasonable good fit for the data, with overall goodness-of-fit test not being significant (p-value is 1)
+
+```{r goodnessofit_logistic1, include = TRUE, warning = FALSE, echo = FALSE}
+mydata <- mutate(mydata, fr_binned = ifelse(failure_rate == 0, 0, 1))
+
+log1 <- glm(fr_binned~Age+Diameter+Length+Region,
+            family = binomial(link = 'logit'),
+            data = mydata)
+with(log1, cbind(res.deviance = deviance, df = df.residual,
+                  p = pchisq(deviance, df.residual, lower.tail=FALSE)))
+```
+
+The summary model is: 
+
+```{r logistic1, include = TRUE, warning = FALSE, echo = FALSE}
+summary(log1)
+```
+
+From summary it looks like Region might not contribute too much to the model, so it's worth trying to model without this variable. In layman' terms, this means that regions have the same pipe failure rates. The following charts show how Length and Age compare in each region:
+
+```{r regions_comp, include = TRUE, warning = FALSE, echo = FALSE, fig.width=10, fig.height = 8, fig.align = 'center'}
+  length_byDiam_in_region <- group_by(mydata, Region, Diameter) %>%
+    summarise(avg_length = mean(Length), median_length = median(Length))
+
+  ggplot(length_byDiam_in_region, aes(x=factor(Diameter), y=avg_length, color = Region)) +
+    geom_point(size = 4) + # shows length averages by diameter for each region
+    theme_bw() +
+    labs(x = "Diameter")
+    
+   age_byDiam_in_region <- group_by(mydata, Region, Diameter) %>%
+  summarise(avg_age = mean(Age), median_age = median(Age)) 
+
+   ggplot(age_byDiam_in_region, aes(x=factor(Diameter), y=avg_age, color = Region)) +
+  geom_point(size = 5) + # shows length averages by diameter for each region
+  theme_bw() +
+    labs(x = "Age")
+```
+
+After testing the difference between the first and the second logistic model (without Region), the p-value is almost 0.05 showing little evidence against null hypothesis that both models are the same. It is fairly safe to ignore Region variable in this regression model.  
+
+```{r test_models, include = TRUE, warning = FALSE, echo = FALSE}
+log1 <- glm(fr_binned~Age+Diameter+Length+Region,
+            family = binomial(link = 'logit'),
+            data = mydata)
+log2 <- update(log1, . ~ . - Region)
+anova(log2, log1, test="Chisq")
+```
+
+The final logistic model is: 
+```{r logistic2, include = TRUE, warning = FALSE, echo = FALSE}
+summary(log2)
+```
+
+## Model diagnostics
+
+The model is reasonable good fit for the data, with overall goodness-of-fit test not being significant (p-value is 1)
+
+```{r goodnessofit_logistic2, include = TRUE, warning = FALSE, echo = FALSE}
+with(log2, cbind(res.deviance = deviance, df = df.residual,
+                  p = pchisq(deviance, df.residual, lower.tail=FALSE)))
+
+```
+
+Deviance residuals have a unimodal roughly symmetrical, so it is approximately normal. 
+
+```{r logistivc2_diagnostic, include = TRUE, warning = FALSE, echo = FALSE, fig.width=10, fig.height = 8, fig.align = 'center'}
+### 1. deviance residuals should be approx normally distributed
+modelPoisson <- summary(log2)
+x <- modelPoisson$deviance.resid
+hist(x,
+     col="red",
+     breaks=10)
+```
+
+Residual plots show lack of patterns in variance for Age and Diameter but it's very hard to see anything in Length. 
+
+```{r log2_resid_plots, include = TRUE, warning = FALSE, echo = FALSE, fig.width=10, fig.height = 8, fig.align = 'center'}
+residualPlots(log2)
+```
+
+It looks like a resonable model. However, the problems come from extreme values in explanatory variables (Length, Age) which turn out to be influential points. This means that without a few values the model can change significantly. For example, Cook's distance is one of the measures that shows some influential points. All points above the red line are considered too large. 
+
+```{r log2_cooks, include = TRUE, warning = FALSE, echo = FALSE, fig.width=10, fig.height = 8, fig.align = 'center'}
+n <- nrow(mydata)
+cutoff <- 4/((nrow(mydata)-length(log2$coefficients)-2))  # cut off for Cooks
+cutoffC <- as.data.frame(rep(cutoff, n)) 
+colnames(cutoffC) <- "Cook"
+plot(log2, which=4, cook.levels=cutoff)
+abline(h = cutoffC$Cook, col = "red")
+```
+
+Another measure, leverage, shows again many data points above the threshold. 
+
+
+```{r log2_leverage, include = TRUE, warning = FALSE, echo = FALSE, fig.width=10, fig.height = 8, fig.align = 'center'}
+n <- nrow(mydata)
+library(zoo)
+infl_log2 <- influence(log2)
+h <- as.data.frame(infl_log2$hat) # Leverage H
+colnames(h) <- "hat"
+cutoffH <-  3*4/n # cut off for Leverage 
+cutoffLeverageH <-  as.data.frame(rep(cutoffH, n))
+colnames(cutoffLeverageH) <- "H"
+
+xaxis<- index(mydata)
+plot(xaxis, h$hat)
+abline(h=cutoffLeverageH$H, col = "red")
+```
+
+
+There are other measures. A list of all points that fall outside a reasonable range and potentially being influential to the model is: 
+
+
+```{r table1, include = TRUE, results = 'asis', message = FALSE, warning = FALSE}
+#Dffit
+cutoffD <- 2*(sqrt(4/n)) # cutoff for D
+
+influential <- influence.measures(log2)
+influential_df <- as.data.frame(influential[[1]]) %>%
+  mutate(Influential = if_else(hat > cutoffH, 1, 
+                              if_else(cook.d> cutoffC, 1, 
+                                      if_else(abs(dffit)> cutoffD,1, 0))))
+infl <- as.data.frame(influential_df$Influential)
+colnames(infl) <- "Influential"
+detach("package:car", unload=TRUE)
+detach("package:MASS", unload=TRUE)
+
+Influential_data <- cbind(mydata, infl) %>%
+  filter(Influential == 1) %>%
+  select(c(Region, Diameter, Age, Length, Events))
+knitr::kable(Influential_data, caption = "Potential influential data points")
+
+```
+
+If possible, all these data points should be checked with the source, looking for any problems with recording them. 
+
+## Interpretation 
+
+The parameter estimates from the model are: 
+
+* Intercept = -1.617071
+* Age = 0.012113
+* Diameter = -0.002297
+* Length = 1.424927
+
+They suggest that with age the probability of pipe assets failures is likely to increase the longer the pipe the more likely it is to fail. Also, failures are more likely for pipes with smaller diameter than larger diameter. 
+
+In logistic model relationships between response and explanatory variables are expressed through log odds and odds ratio. It's easier to understand odds ratio calculated by exponentiating regression coefficients.
+
+```{r ratios, include = TRUE}
+ exp(coefficients(log2)) 
+
+```
+
+* Age: for each additional year  odds of the pipe failure rate's increases by an estimated ratio of 1.0121866  
+
+* Diameter: for one unit increase in diameter (i.e. 1mm), the pipe failure rate's odds decreases by an estimated ratio of 0.9977055
+
+* Length: for one unit increase in length (i.e. 1Km), the pipe failure rate's odds increases by an estimated ratio of 4.1575538
+
+
+### Predictions of pipe assets failures 
+
+
+First of all, after splitting the data to get a train and test dataset, the misclassification error is calculated:
+
+```{r validating, include = TRUE}
+train <- mydata[1:1500,]
+test <- mydata[1500:2648,]
+
+model <- glm(fr_binned~Age+Diameter+Length,
+             family = binomial(link = 'logit'),
+             data = train)
+
+fitted.results <- predict(model, 
+                          newdata = subset(test, 
+                                           select = c(2,3,4)), 
+                          type = 'response')
+fitted.results <- ifelse(fitted.results > 0.5, 1,0)
+
+misClasificError <- mean(fitted.results != test$fr_binned)
+misClasificError*100
+
+```
+
+This means that the model has very weak predicting power, at roughly 19% correct classification of failures. 
+
+The model can also be assessed by ROC curve: 
+
+```{r roc, include = TRUE}
+# ROC plot
+library(ROCR)
+pr <- prediction(fitted.results, test$fr_binned)
+prf <- performance(pr, measure = "tpr", x.measure = "fpr")
+plot(prf)
+
+```
+
+With area under the curve at 77%, it is fairly reasonable model. 
+```{r auc, include = TRUE}
+auc <- performance(pr, measure = "auc")
+auc <- auc@y.values[[1]]
+auc # area under the curve
+```
+
+
+For example, a group of assets with diameter 100mm, 95 years old and length of 0.5Km will have a probability of failing of: 1.6%
+
+```{r prediction, include = TRUE}
+#prediction of one value
+new.dat <- data.frame(Diameter = 100, Age = 95, Length = 0.5)
+
+predict(log2, newdata = new.dat, interval = 'confidence') #predicting mean # interval = 'prediction'
+```
